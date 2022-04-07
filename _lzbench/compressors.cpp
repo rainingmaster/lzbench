@@ -75,16 +75,134 @@ int64_t lzbench_brieflz_decompress(char *inbuf, size_t insize, char *outbuf, siz
 #include "brotli/encode.h"
 #include "brotli/decode.h"
 
-int64_t lzbench_brotli_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t windowLog, char*, bool)
+typedef struct {
+    BrotliEncoderState* encoder_state;
+    BrotliDecoderState* decoder_state;
+    std::string dictionary;
+    BrotliEncoderPreparedDictionary *encoder_dictionary;
+} brotli_params_s;
+
+// dictionary could be train follow this link: https://github.com/google/brotli/issues/697
+void lzbench_brotli_reset_encoder_state(brotli_params_s* brotli_params, size_t level, size_t windowLog)
 {
-    size_t actual_osize = outsize;
-    return BrotliEncoderCompress(level, windowLog, BROTLI_DEFAULT_MODE, insize, (const uint8_t*)inbuf, &actual_osize, (uint8_t*)outbuf) == 0 ? 0 : actual_osize;
+    if (brotli_params->encoder_state) BrotliEncoderDestroyInstance(brotli_params->encoder_state);
+    brotli_params->encoder_state = BrotliEncoderCreateInstance(nullptr, nullptr, nullptr);
+    BrotliEncoderSetParameter(brotli_params->encoder_state, BROTLI_PARAM_QUALITY, level);
+    if (!windowLog) windowLog = BROTLI_DEFAULT_WINDOW; // sliding window size. Range is 10 to 24.
+    BrotliEncoderSetParameter(brotli_params->encoder_state, BROTLI_PARAM_LGWIN, windowLog);
+    if (brotli_params->encoder_dictionary) {
+        auto result = BrotliEncoderAttachPreparedDictionary(brotli_params->encoder_state, brotli_params->encoder_dictionary);
+    }
 }
 
-int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char*, bool)
+void lzbench_brotli_reset_decoder_state(brotli_params_s* brotli_params)
 {
+    if (brotli_params->decoder_state) BrotliDecoderDestroyInstance(brotli_params->decoder_state);
+    brotli_params->decoder_state = BrotliDecoderCreateInstance(nullptr, nullptr, nullptr);
+    if (!brotli_params->dictionary.empty()) {
+        auto result = BrotliDecoderAttachDictionary(brotli_params->decoder_state,
+                                      BROTLI_SHARED_DICTIONARY_RAW,
+                                      brotli_params->dictionary.length(),
+                                      (const uint8_t*)brotli_params->dictionary.data());
+    }
+}
+
+char* lzbench_brotli_init(size_t insize, size_t level, size_t windowLog, const std::string& dictionary)
+{
+    brotli_params_s* brotli_params = (brotli_params_s*) malloc(sizeof(brotli_params_s));
+    if (!brotli_params) return NULL;
+	memset(brotli_params, 0, sizeof(brotli_params_s));
+
+    if (!dictionary.empty()) {
+        brotli_params->dictionary = dictionary;
+        brotli_params->encoder_dictionary = BrotliEncoderPrepareDictionary(BROTLI_SHARED_DICTIONARY_RAW,
+                                                                           dictionary.length(),
+                                                                           (const uint8_t*)dictionary.data(),
+                                                                           BROTLI_MAX_QUALITY,
+                                                                           nullptr,
+                                                                           nullptr,
+                                                                           nullptr);
+    }
+    lzbench_brotli_reset_encoder_state(brotli_params, level, windowLog);
+    lzbench_brotli_reset_decoder_state(brotli_params);
+
+    return (char*) brotli_params;
+}
+
+void lzbench_brotli_deinit(char* workmem)
+{
+    brotli_params_s* brotli_params = (brotli_params_s*) workmem;
+    if (!brotli_params) return;
+    if (brotli_params->encoder_state) BrotliEncoderDestroyInstance(brotli_params->encoder_state);
+    if (brotli_params->decoder_state) BrotliDecoderDestroyInstance(brotli_params->decoder_state);
+    free(workmem);
+}
+
+int64_t lzbench_brotli_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t windowLog, char* workmem, bool endstream)
+{
+    brotli_params_s* brotli_params = (brotli_params_s*) workmem;
+    if (!brotli_params || !brotli_params->encoder_state) return 0;
+
+    BROTLI_BOOL result;
     size_t actual_osize = outsize;
-    return BrotliDecoderDecompress(insize, (const uint8_t*)inbuf, &actual_osize, (uint8_t*)outbuf) == BROTLI_DECODER_RESULT_ERROR ? 0 : actual_osize;
+    // return BrotliEncoderCompress(level, windowLog, BROTLI_DEFAULT_MODE, insize, (const uint8_t*)inbuf, &actual_osize, (uint8_t*)outbuf) == 0 ? 0 : actual_osize;
+    while (insize > 0) {
+        if (BrotliEncoderCompressStream(brotli_params->encoder_state,
+                                        BROTLI_OPERATION_PROCESS,
+                                        &insize,
+                                        (const uint8_t**)&inbuf,
+                                        &actual_osize,
+                                        (uint8_t**)&outbuf,
+                                        NULL)
+            != BROTLI_TRUE) {
+            return 0;
+        }
+    }
+    do {
+        if (BrotliEncoderCompressStream(brotli_params->encoder_state,
+                                        endstream ? BROTLI_OPERATION_FINISH : BROTLI_OPERATION_FLUSH,
+                                        &insize,
+                                        (const uint8_t**)&inbuf,
+                                        &actual_osize,
+                                        (uint8_t**)&outbuf,
+                                        NULL)
+            != BROTLI_TRUE) {
+            return 0;
+        }
+    } while (BrotliEncoderHasMoreOutput(brotli_params->encoder_state));
+
+    if (endstream) {
+        lzbench_brotli_reset_encoder_state(brotli_params, level, windowLog);
+    }
+
+    return outsize - actual_osize;
+}
+
+int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char* workmem, bool endstream)
+{
+    brotli_params_s* brotli_params = (brotli_params_s*) workmem;
+    if (!brotli_params || !brotli_params->decoder_state) return 0;
+
+    BROTLI_BOOL result;
+    size_t actual_osize = outsize;
+    // return BrotliDecoderDecompress(insize, (const uint8_t*)inbuf, &actual_osize, (uint8_t*)outbuf) == BROTLI_DECODER_RESULT_ERROR ? 0 : actual_osize;
+    while (insize > 0) {
+        if (BrotliDecoderDecompressStream(brotli_params->decoder_state,
+                                        &insize,
+                                        (const uint8_t**)&inbuf,
+                                        &actual_osize,
+                                        (uint8_t**)&outbuf,
+                                        NULL)
+            != BROTLI_TRUE) {
+            return 0;
+        }
+    }
+
+    if (endstream) { // reset for next round
+        lzbench_brotli_reset_decoder_state(brotli_params);
+    }
+
+    return outsize - actual_osize;
 }
 
 #endif // BENCH_REMOVE_BROTLI

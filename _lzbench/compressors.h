@@ -33,9 +33,13 @@ int64_t lzbench_return_0(char *inbuf, size_t insize, char *outbuf, size_t outsiz
 
 
 #ifndef BENCH_REMOVE_BROTLI
+    char* lzbench_brotli_init(size_t insize, size_t level, size_t, const std::string&);
+    void lzbench_brotli_deinit(char* workmem);
 	int64_t lzbench_brotli_compress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t level, size_t, char*, bool);
 	int64_t lzbench_brotli_decompress(char *inbuf, size_t insize, char *outbuf, size_t outsize, size_t, size_t, char*, bool);
 #else
+	#define lzbench_brotli_init NULL
+	#define lzbench_brotli_deinit NULL
 	#define lzbench_brotli_compress NULL
 	#define lzbench_brotli_decompress NULL
 #endif
